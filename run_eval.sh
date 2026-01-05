@@ -7,9 +7,9 @@
 MODEL_TYPE="${MODEL_TYPE:-student}"  # student 或 teacher
 MODEL_PATH="${MODEL_PATH:-./chronos-2-distilled/final_model}"  # 学生模型路径
 TEACHER_MODEL_ID="${TEACHER_MODEL_ID:-amazon/chronos-2}"  # 教师模型 ID
-EVAL_DIR="${EVAL_DIR:-datasets/eval}"
-# DATASET="${DATASET:-}"  # 如果设置，则只评估该数据集（滑动窗口模式）
-DATASET="ETT-small/ETTm1"
+EVAL_DIR="${EVAL_DIR:-datasets/Eval_Data}"
+DATASET="${DATASET:-}"  # 如果设置，则只评估该数据集（滑动窗口模式）
+# DATASET="ETT-small/ETTm1"  # 默认数据集（已注释，可通过环境变量设置）
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-720}"
 HORIZON="${HORIZON:-96}"
 STRIDE="${STRIDE:-1}"  # 滑动窗口步长（仅在 DATASET 模式下有效）

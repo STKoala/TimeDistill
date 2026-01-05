@@ -15,7 +15,23 @@ import warnings
 import json
 from datetime import datetime
 import logging
+import sys
 warnings.filterwarnings('ignore')
+
+# 导入数据加载器
+# 确保可以导入 data_provider 模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+try:
+    from data_provider.data_loader import Dataset_Custom
+except ImportError:
+    # 如果导入失败，尝试添加父目录到路径
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    from TimeDistill.data_provider.data_loader import Dataset_Custom
 
 
 def setup_logging(log_dir: str = "log", model_name: str = None, 
@@ -284,14 +300,14 @@ def prepare_data(
     target_col: str = None
 ):
     """
-    准备测试数据
+    准备测试数据（使用 data_loader.py 的数据加载逻辑）
     
     Parameters
     ----------
     data_path : str
         数据文件路径
     start_idx : int, optional
-        起始索引，如果为 None 则从数据末尾往前取
+        起始索引，如果为 None 则从测试集末尾往前取
     context_length : int
         上下文长度
     horizon : int
@@ -302,43 +318,78 @@ def prepare_data(
     Returns
     -------
     tuple
-        (context_data, future_data, context_df) 或 None（如果失败）
+        (context_data, future_data, context_df, target_col) 或 None（如果失败）
     """
     logger = logging.getLogger(__name__)
     
     try:
-        df = pd.read_csv(data_path)
+        # 解析路径
+        data_path_obj = Path(data_path)
+        root_path = str(data_path_obj.parent)
+        data_file = data_path_obj.name
+        
+        # 读取原始数据以确定目标列
+        df_raw = pd.read_csv(data_path)
         
         # 确定目标列
         if target_col is None:
             # 排除时间列，使用最后一个数值列
             exclude_cols = ['date', 'timestamp', 'time', 'id', 'item_id', 'time_idx']
-            numeric_cols = [col for col in df.columns 
+            numeric_cols = [col for col in df_raw.columns 
                           if col.lower() not in [c.lower() for c in exclude_cols]
-                          and pd.api.types.is_numeric_dtype(df[col])]
+                          and pd.api.types.is_numeric_dtype(df_raw[col])]
             if len(numeric_cols) == 0:
                 logger.warning(f"未找到数值列，使用最后一列")
-                target_col = df.columns[-1]
+                target_col = df_raw.columns[-1]
             else:
                 target_col = numeric_cols[-1]  # 使用最后一个数值列（通常是 OT）
         
-        if target_col not in df.columns:
+        if target_col not in df_raw.columns:
             logger.warning(f"目标列 {target_col} 不存在，使用最后一列")
-            target_col = df.columns[-1]
+            target_col = df_raw.columns[-1]
         
-        # 确定起始索引
+        # 使用 Dataset_Custom 加载数据
+        # size: [seq_len, label_len, pred_len]
+        # 对于评估，label_len 可以设为 0 或与 seq_len 相同
+        label_len = context_length  # 使用 context_length 作为 label_len
+        dataset = Dataset_Custom(
+            root_path=root_path,
+            flag='test',  # 使用测试集
+            size=[context_length, label_len, horizon],
+            features='S',  # 单变量预测
+            data_path=data_file,
+            target=target_col,
+            scale=True,  # 使用归一化
+            timeenc=0,  # 使用简单时间编码
+            freq='h'  # 默认小时频率，可根据数据调整
+        )
+        
+        # 获取数据集长度
+        dataset_len = len(dataset)
+        if dataset_len == 0:
+            logger.error(f"数据集为空或长度不足")
+            return None
+        
+        # 确定使用的索引
         if start_idx is None:
-            # 从数据末尾往前取，确保有足够的数据
-            start_idx = max(0, len(df) - context_length - horizon - 100)
+            # 从测试集末尾往前取
+            start_idx = max(0, dataset_len - 1)
+        else:
+            # 确保索引有效
+            start_idx = min(start_idx, dataset_len - 1)
         
-        # 确保有足够的数据
-        if start_idx + context_length + horizon > len(df):
-            logger.warning(f"数据不足，调整 start_idx: {len(df)} -> {max(0, len(df) - context_length - horizon)}")
-            start_idx = max(0, len(df) - context_length - horizon)
+        # 获取数据
+        seq_x, seq_y, seq_x_mark, seq_y_mark = dataset[start_idx]
         
-        # 提取数据
-        context_data = df[target_col].iloc[start_idx:start_idx + context_length].values
-        future_data = df[target_col].iloc[start_idx + context_length:start_idx + context_length + horizon].values
+        # seq_x 是归一化后的 context 数据 (context_length, 1)
+        # seq_y 是归一化后的目标数据 (label_len + horizon, 1)
+        # 提取 future 部分（最后 horizon 个点）
+        context_data_normalized = seq_x.flatten()  # (context_length,)
+        future_data_normalized = seq_y[-horizon:].flatten()  # (horizon,)
+        
+        # 反归一化获取原始值（用于计算指标）
+        context_data = dataset.inverse_transform(context_data_normalized.reshape(-1, 1)).flatten()
+        future_data = dataset.inverse_transform(future_data_normalized.reshape(-1, 1)).flatten()
         
         # 检查数据有效性
         if len(context_data) < context_length or len(future_data) < horizon:
@@ -349,13 +400,38 @@ def prepare_data(
             logger.warning(f"数据包含 NaN 值")
             return None
         
-        # 创建 Chronos-2 需要的 DataFrame 格式
-        if 'date' in df.columns:
-            context_df = pd.DataFrame({
-                'id': ['test_series'] * len(context_data),
-                'timestamp': pd.to_datetime(df['date'].iloc[start_idx:start_idx + context_length]),
-                'target': context_data
-            })
+        # 创建 Chronos-2 需要的 DataFrame 格式（使用原始值，不归一化）
+        # 需要从原始数据中获取时间戳
+        if 'date' in df_raw.columns:
+            # 计算在原始数据中的位置
+            # Dataset_Custom 的测试集从 border1s[2] 开始
+            num_train = int(len(df_raw) * 0.7)
+            num_test = int(len(df_raw) * 0.2)
+            # border1s[2] = len(df_raw) - num_test - seq_len
+            test_border1 = len(df_raw) - num_test - context_length
+            # 在测试集中的实际位置
+            actual_start = test_border1 + start_idx
+            
+            # 确保索引有效
+            if actual_start + context_length <= len(df_raw):
+                try:
+                    timestamps = pd.to_datetime(df_raw['date'].iloc[actual_start:actual_start + context_length])
+                    context_df = pd.DataFrame({
+                        'id': ['test_series'] * len(context_data),
+                        'timestamp': timestamps,
+                        'target': context_data
+                    })
+                except Exception as e:
+                    logger.debug(f"时间戳解析失败: {e}")
+                    context_df = pd.DataFrame({
+                        'id': ['test_series'] * len(context_data),
+                        'target': context_data
+                    })
+            else:
+                context_df = pd.DataFrame({
+                    'id': ['test_series'] * len(context_data),
+                    'target': context_data
+                })
         else:
             context_df = pd.DataFrame({
                 'id': ['test_series'] * len(context_data),
@@ -427,7 +503,7 @@ def predict_with_model(pipeline, context_df, horizon: int):
         return None
 
 
-def calculate_metrics(pred: np.ndarray, true: np.ndarray):
+def calculate_metrics(pred: np.ndarray, true: np.ndarray, context_data: np.ndarray = None):
     """
     计算评估指标
     
@@ -437,6 +513,8 @@ def calculate_metrics(pred: np.ndarray, true: np.ndarray):
         预测值
     true : np.ndarray
         真实值
+    context_data : np.ndarray, optional
+        历史信息（context），用于计算归一化的均值和标准差
         
     Returns
     -------
@@ -449,9 +527,25 @@ def calculate_metrics(pred: np.ndarray, true: np.ndarray):
     
     pred = pred[:min_len]
     true = true[:min_len]
-    
+    # 
+    # if context_data is not None and len(context_data) > 0:
+    #     context_mean = np.mean(context_data)
+    #     context_std = np.std(context_data)
+        
+    #     # 避免除零
+    #     if context_std == 0:
+    #         context_std = 1.0
+
+    #     pred_normalized = (pred - context_mean) / context_std
+    #     true_normalized = (true - context_mean) / context_std
+        
+    #     mse = np.mean((pred_normalized - true_normalized) ** 2)
+    #     mae = np.mean(np.abs(pred_normalized - true_normalized))
+    # else:
+    print(f"没有提供历史信息，使用原始值进行计算")
     mse = np.mean((pred - true) ** 2)
     mae = np.mean(np.abs(pred - true))
+    
     rmse = np.sqrt(mse)
     
     # 计算 MAPE（如果真实值不为0）
@@ -471,12 +565,12 @@ def evaluate_dataset_sliding_window(
     pipeline,
     dataset_name: str,
     data_path: str,
-    context_length: int = 96,
-    horizon: int = 24,
+    context_length: int = 720,
+    horizon: int = 96,
     stride: int = 1
 ):
     """
-    使用滑动窗口评估单个数据集的所有窗口
+    使用滑动窗口评估单个数据集的所有窗口（使用 data_loader.py 的数据加载逻辑）
     
     Parameters
     ----------
@@ -506,36 +600,53 @@ def evaluate_dataset_sliding_window(
     logger.info(f"{'='*60}")
     
     try:
-        df = pd.read_csv(data_path)
+        # 解析路径
+        data_path_obj = Path(data_path)
+        root_path = str(data_path_obj.parent)
+        data_file = data_path_obj.name
+        
+        # 读取原始数据以确定目标列
+        df_raw = pd.read_csv(data_path)
         
         # 确定目标列
         exclude_cols = ['date', 'timestamp', 'time', 'id', 'item_id', 'time_idx']
-        numeric_cols = [col for col in df.columns 
+        numeric_cols = [col for col in df_raw.columns 
                       if col.lower() not in [c.lower() for c in exclude_cols]
-                      and pd.api.types.is_numeric_dtype(df[col])]
+                      and pd.api.types.is_numeric_dtype(df_raw[col])]
         if len(numeric_cols) == 0:
             logger.warning(f"未找到数值列，使用最后一列")
-            target_col = df.columns[-1]
+            target_col = df_raw.columns[-1]
         else:
             target_col = numeric_cols[-1]
         
-        if target_col not in df.columns:
+        if target_col not in df_raw.columns:
             logger.warning(f"目标列 {target_col} 不存在，使用最后一列")
-            target_col = df.columns[-1]
+            target_col = df_raw.columns[-1]
         
         logger.info(f"目标列: {target_col}")
-        logger.info(f"数据总长度: {len(df)}")
+        logger.info(f"数据总长度: {len(df_raw)}")
         
-        # 获取目标列数据
-        series = df[target_col].values
+        # 使用 Dataset_Custom 加载数据
+        label_len = context_length
+        dataset = Dataset_Custom(
+            root_path=root_path,
+            flag='test',  # 使用测试集
+            size=[context_length, label_len, horizon],
+            features='S',
+            data_path=data_file,
+            target=target_col,
+            scale=True,
+            timeenc=0,
+            freq='h'
+        )
         
-        # 检查数据有效性
-        if np.any(np.isnan(series)):
-            logger.warning(f"数据包含 NaN 值，将进行填充")
-            series = pd.Series(series).ffill().bfill().values
+        dataset_len = len(dataset)
+        if dataset_len == 0:
+            logger.error(f"数据集为空或长度不足")
+            return None
         
-        # 计算所有可能的窗口
-        total_windows = (len(series) - context_length - horizon) // stride + 1
+        # 计算所有可能的窗口（考虑 stride）
+        total_windows = (dataset_len - 1) // stride + 1
         if total_windows <= 0:
             logger.error(f"数据长度不足，无法创建滑动窗口")
             return None
@@ -545,65 +656,80 @@ def evaluate_dataset_sliding_window(
         # 存储所有预测和真实值
         all_predictions = []
         all_true_values = []
+        all_context_data = []  # 存储所有窗口的 context 数据，用于归一化
         successful_windows = 0
         failed_windows = 0
         
+        # 计算测试集在原始数据中的起始位置
+        # Dataset_Custom 的测试集从 border1s[2] 开始
+        num_train = int(len(df_raw) * 0.7)
+        num_test = int(len(df_raw) * 0.2)
+        test_border1 = len(df_raw) - num_test - context_length
+        
         # 遍历所有窗口
-        for i in range(0, len(series) - context_length - horizon + 1, stride):
-            start_idx = i
-            end_idx = start_idx + context_length + horizon
-            
-            if end_idx > len(series):
-                break
-            
-            # 提取窗口数据
-            window_data = series[start_idx:end_idx]
-            context_data = window_data[:context_length]
-            future_data = window_data[context_length:]
-            
-            # 检查数据有效性
-            if np.any(np.isnan(context_data)) or np.any(np.isnan(future_data)):
-                failed_windows += 1
-                continue
-            
-            # 创建 Chronos-2 需要的 DataFrame 格式
-            if 'date' in df.columns:
-                try:
-                    context_df = pd.DataFrame({
-                        'id': ['test_series'] * len(context_data),
-                        'timestamp': pd.to_datetime(df['date'].iloc[start_idx:start_idx + context_length]),
-                        'target': context_data
-                    })
-                except:
-                    context_df = pd.DataFrame({
-                        'id': ['test_series'] * len(context_data),
-                        'target': context_data
-                    })
-            else:
-                context_df = pd.DataFrame({
-                    'id': ['test_series'] * len(context_data),
-                    'target': context_data
-                })
-            
-            # 进行预测
+        for window_idx in range(0, dataset_len, stride):
             try:
+                # 获取数据
+                seq_x, seq_y, seq_x_mark, seq_y_mark = dataset[window_idx]
+                
+                # 提取 context 和 future 数据（归一化后的）
+                context_data_normalized = seq_x.flatten()
+                future_data_normalized = seq_y[-horizon:].flatten()
+                
+                # 反归一化获取原始值
+                context_data = dataset.inverse_transform(context_data_normalized.reshape(-1, 1)).flatten()
+                future_data = dataset.inverse_transform(future_data_normalized.reshape(-1, 1)).flatten()
+                
+                # 检查数据有效性
+                if len(context_data) < context_length or len(future_data) < horizon:
+                    failed_windows += 1
+                    continue
+                
+                if np.any(np.isnan(context_data)) or np.any(np.isnan(future_data)):
+                    failed_windows += 1
+                    continue
+                
+                # 创建 Chronos-2 需要的 DataFrame 格式（使用原始值）
+                actual_start = test_border1 + window_idx
+                if 'date' in df_raw.columns and actual_start + context_length <= len(df_raw):
+                    try:
+                        timestamps = pd.to_datetime(df_raw['date'].iloc[actual_start:actual_start + context_length])
+                        context_df = pd.DataFrame({
+                            'id': ['test_series'] * len(context_data),
+                            'timestamp': timestamps,
+                            'target': context_data
+                        })
+                    except:
+                        context_df = pd.DataFrame({
+                            'id': ['test_series'] * len(context_data),
+                            'target': context_data
+                        })
+                else:
+                    context_df = pd.DataFrame({
+                        'id': ['test_series'] * len(context_data),
+                        'target': context_data
+                    })
+                
+                # 进行预测
                 predictions = predict_with_model(pipeline, context_df, horizon)
                 if predictions is not None and len(predictions) > 0:
                     # 确保长度匹配
                     min_len = min(len(predictions), len(future_data))
                     all_predictions.append(predictions[:min_len])
                     all_true_values.append(future_data[:min_len])
+                    all_context_data.append(context_data)  # 保存 context 数据
                     successful_windows += 1
                 else:
                     failed_windows += 1
+                    
             except Exception as e:
-                logger.debug(f"窗口 {i} 预测失败: {e}")
+                logger.debug(f"窗口 {window_idx} 处理失败: {e}")
                 failed_windows += 1
                 continue
             
             # 每100个窗口输出一次进度
-            if (i // stride + 1) % 100 == 0:
-                logger.info(f"进度: {i // stride + 1}/{total_windows} 窗口 (成功: {successful_windows}, 失败: {failed_windows})")
+            if (window_idx // stride + 1) % 100 == 0:
+                logger.info(f"进度: {window_idx // stride + 1}/{total_windows} 窗口 (成功: {successful_windows}, 失败: {failed_windows})")
         
         logger.info(f"窗口评估完成: 成功 {successful_windows}, 失败 {failed_windows}")
         
@@ -614,14 +740,27 @@ def evaluate_dataset_sliding_window(
         # 合并所有预测和真实值
         all_pred = np.concatenate(all_predictions)
         all_true = np.concatenate(all_true_values)
+        all_context = np.concatenate(all_context_data)  # 合并所有 context 数据
         
         logger.info(f"总预测点数: {len(all_pred)}")
         logger.info(f"预测值范围: [{all_pred.min():.4f}, {all_pred.max():.4f}]")
         logger.info(f"真实值范围: [{all_true.min():.4f}, {all_true.max():.4f}]")
         
-        # 计算整体指标
-        mse = np.mean((all_pred - all_true) ** 2)
-        mae = np.mean(np.abs(all_pred - all_true))
+        # 计算整体指标（使用所有 context 数据的均值和方差进行归一化）
+        context_mean = np.mean(all_context)
+        context_std = np.std(all_context)
+        
+        # 避免除零
+        if context_std == 0:
+            context_std = 1.0
+        
+        # 对预测值和真实值进行归一化
+        all_pred_normalized = (all_pred - context_mean) / context_std
+        all_true_normalized = (all_true - context_mean) / context_std
+        
+        # 使用归一化后的值计算指标
+        mse = np.mean((all_pred_normalized - all_true_normalized) ** 2)
+        mae = np.mean(np.abs(all_pred_normalized - all_true_normalized))
         rmse = np.sqrt(mse)
         
         metrics = {
@@ -631,7 +770,7 @@ def evaluate_dataset_sliding_window(
             'MAPE': None
         }
         
-        # 计算 MAPE（如果真实值不为0）
+        # 计算 MAPE（如果真实值不为0，使用原始值）
         if np.all(all_true != 0):
             mape = np.mean(np.abs((all_pred - all_true) / all_true)) * 100
             metrics['MAPE'] = float(mape)
@@ -727,8 +866,8 @@ def evaluate_dataset(
         
         logger.info(f"预测完成，预测值范围: [{predictions.min():.4f}, {predictions.max():.4f}]")
         
-        # 计算指标
-        metrics = calculate_metrics(predictions, future_data)
+        # 计算指标（使用 context_data 进行归一化）
+        metrics = calculate_metrics(predictions, future_data, context_data)
         if metrics is None:
             logger.error(f"指标计算失败: {dataset_name}")
             return None
