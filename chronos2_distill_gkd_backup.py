@@ -31,43 +31,6 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-class FeatureRegressor(nn.Module):
-    """特征回归器，用于将教师模型的特征维度转换为学生模型的维度"""
-    
-    def __init__(self, teacher_dim: int, student_dim: int):
-        """
-        Parameters
-        ----------
-        teacher_dim : int
-            教师模型的隐藏层维度
-        student_dim : int
-            学生模型的隐藏层维度
-        """
-        super().__init__()
-        self.regressor = nn.Sequential(
-            nn.Linear(teacher_dim, student_dim),
-            nn.LayerNorm(student_dim),
-            nn.GELU(),
-            nn.Linear(student_dim, student_dim)
-        )
-    
-    def forward(self, teacher_features: torch.Tensor) -> torch.Tensor:
-        """
-        将教师特征转换为学生维度
-        
-        Parameters
-        ----------
-        teacher_features : torch.Tensor
-            教师模型特征，形状为 (batch_size, seq_len, teacher_dim)
-            
-        Returns
-        -------
-        torch.Tensor
-            转换后的特征，形状为 (batch_size, seq_len, student_dim)
-        """
-        return self.regressor(teacher_features)
-
-
 class Chronos2DistillationDataset(Dataset):
     """Chronos-2 蒸馏数据集（参考 LightGTS 的处理方式）"""
     
@@ -292,30 +255,9 @@ class Chronos2DistillationTrainer:
             param.requires_grad = False
         print("教师模型已设置为评估模式并冻结所有参数")
         
-        # 创建特征回归器（用于维度对齐）
-        teacher_dim = teacher_pipeline.model.config.d_model
-        student_dim = student_model.config.d_model
-        self.feature_regressor_first = FeatureRegressor(teacher_dim, student_dim).to(device)
-        self.feature_regressor_last = FeatureRegressor(teacher_dim, student_dim).to(device)
-        print(f"创建特征回归器: 教师维度={teacher_dim}, 学生维度={student_dim}")
-        
-        # 用于存储hook提取的特征
-        self.teacher_features = {}
-        self.student_features = {}
-        
-        # 初始化handles列表
-        self.teacher_handles = []
-        self.student_handles = []
-        
-        # 注册hook来提取特征
-        self._register_hooks()
-        
-        # 优化器（包含学生模型和regressor的参数）
-        optimizer_params = list(self.student_model.parameters()) + \
-                          list(self.feature_regressor_first.parameters()) + \
-                          list(self.feature_regressor_last.parameters())
+        # 优化器
         self.optimizer = torch.optim.AdamW(
-            optimizer_params,
+            self.student_model.parameters(),
             lr=learning_rate,
             weight_decay=1e-4,  # 添加权重衰减
             eps=1e-8  # 数值稳定性
@@ -341,90 +283,6 @@ class Chronos2DistillationTrainer:
             )
         else:
             self.eval_loader = None
-    
-    def _register_hooks(self):
-        """注册hook来提取教师和学生模型的注意力层特征"""
-        # 清除之前的hook
-        self.teacher_handles = []
-        self.student_handles = []
-        
-        # 获取教师模型的编码器层数
-        teacher_model = self.teacher_pipeline.model
-        teacher_num_layers = len(teacher_model.encoder.block)
-        
-        # 获取学生模型的编码器层数
-        student_num_layers = len(self.student_model.encoder.block)
-        
-        # 教师模型的第一层（索引0）和最后一层（索引teacher_num_layers-1）
-        teacher_first_layer = teacher_model.encoder.block[0]
-        teacher_last_layer = teacher_model.encoder.block[teacher_num_layers - 1]
-        
-        # 学生模型的第一层（索引0）和最后一层（索引student_num_layers-1）
-        student_first_layer = self.student_model.encoder.block[0]
-        student_last_layer = self.student_model.encoder.block[student_num_layers - 1]
-        
-        # 定义hook函数
-        def get_teacher_first_hook(name):
-            def hook(module, input, output):
-                # output是Chronos2EncoderBlockOutput，包含hidden_states
-                if hasattr(output, 'hidden_states'):
-                    self.teacher_features['first'] = output.hidden_states
-                elif isinstance(output, tuple):
-                    self.teacher_features['first'] = output[0]
-                else:
-                    self.teacher_features['first'] = output
-            return hook
-        
-        def get_teacher_last_hook(name):
-            def hook(module, input, output):
-                if hasattr(output, 'hidden_states'):
-                    self.teacher_features['last'] = output.hidden_states
-                elif isinstance(output, tuple):
-                    self.teacher_features['last'] = output[0]
-                else:
-                    self.teacher_features['last'] = output
-            return hook
-        
-        def get_student_first_hook(name):
-            def hook(module, input, output):
-                if hasattr(output, 'hidden_states'):
-                    self.student_features['first'] = output.hidden_states
-                elif isinstance(output, tuple):
-                    self.student_features['first'] = output[0]
-                else:
-                    self.student_features['first'] = output
-            return hook
-        
-        def get_student_last_hook(name):
-            def hook(module, input, output):
-                if hasattr(output, 'hidden_states'):
-                    self.student_features['last'] = output.hidden_states
-                elif isinstance(output, tuple):
-                    self.student_features['last'] = output[0]
-                else:
-                    self.student_features['last'] = output
-            return hook
-        
-        # 注册教师模型的hook
-        teacher_first_handle = teacher_first_layer.register_forward_hook(get_teacher_first_hook('teacher_first'))
-        teacher_last_handle = teacher_last_layer.register_forward_hook(get_teacher_last_hook('teacher_last'))
-        self.teacher_handles = [teacher_first_handle, teacher_last_handle]
-        
-        # 注册学生模型的hook
-        student_first_handle = student_first_layer.register_forward_hook(get_student_first_hook('student_first'))
-        student_last_handle = student_last_layer.register_forward_hook(get_student_last_hook('student_last'))
-        self.student_handles = [student_first_handle, student_last_handle]
-        
-        print("已注册特征提取hook（第一层和最后一层）")
-    
-    def _remove_hooks(self):
-        """移除所有hook"""
-        for handle in self.teacher_handles:
-            handle.remove()
-        for handle in self.student_handles:
-            handle.remove()
-        self.teacher_handles = []
-        self.student_handles = []
     
     def compute_distillation_loss(
         self,
@@ -476,6 +334,38 @@ class Chronos2DistillationTrainer:
             # 准备输入格式（Chronos-2 格式）
             inputs = [{"target": context[i].cpu().numpy()} for i in range(batch_size)]
             
+            # 教师模型预测（不计算梯度）
+            teacher_predictions = None
+            with torch.no_grad():
+                try:
+                    teacher_outputs = self.teacher_pipeline.predict(
+                        inputs,
+                        prediction_length=self.horizon
+                    )
+                    # teacher_outputs 是列表，每个元素是 (n_variates, n_quantiles, prediction_length)
+                    # 提取中位数预测 (quantile 0.5，通常是中间位置)
+                    teacher_predictions = []
+                    for output in teacher_outputs:
+                        if output.ndim == 3:  # (n_variates, n_quantiles, prediction_length)
+                            # 取第一个 variate，中位数 quantile (通常是中间位置)
+                            n_quantiles = output.shape[1]
+                            median_idx = n_quantiles // 2
+                            teacher_predictions.append(output[0, median_idx, :])  # (prediction_length,)
+                        else:
+                            teacher_predictions.append(output.squeeze())
+                    
+                    # 堆叠为 tensor: [batch_size, prediction_length]
+                    teacher_logits = torch.stack(teacher_predictions).to(self.device)
+                except Exception as e:
+                    print(f"警告: 教师模型预测失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 如果教师模型预测失败，跳过这个 batch
+                    continue
+            
+            # 学生模型前向传播
+            self.optimizer.zero_grad()
+            
             # Chronos2Model.forward() 需要 context tensor，形状为 (batch_size, context_length)
             # 还需要 group_ids，形状为 (batch_size,)
             group_ids = torch.arange(batch_size, device=self.device)
@@ -483,50 +373,6 @@ class Chronos2DistillationTrainer:
             # 计算需要预测的 patch 数量
             output_patch_size = self.student_model.chronos_config.output_patch_size
             num_output_patches = (self.horizon + output_patch_size - 1) // output_patch_size
-            
-            # 清空特征缓存
-            self.teacher_features = {}
-            self.student_features = {}
-            
-            # 教师模型前向传播（不计算梯度，用于提取特征和预测）
-            teacher_predictions = None
-            teacher_logits = None
-            with torch.no_grad():
-                try:
-                    # 先调用教师模型的forward来提取特征（hook会自动提取）
-                    teacher_model = self.teacher_pipeline.model
-                    teacher_outputs = teacher_model(
-                        context=context,
-                        group_ids=group_ids,
-                        num_output_patches=num_output_patches
-                    )
-                    
-                    # 从forward输出中提取预测值
-                    teacher_prediction = teacher_outputs.quantile_preds
-                    n_quantiles = teacher_prediction.shape[1]
-                    median_idx = n_quantiles // 2
-                    teacher_logits = teacher_prediction[:, median_idx, :]  # [batch_size, prediction_length]
-                    
-                    # 如果预测长度不匹配，截断或填充
-                    if teacher_logits.shape[1] > self.horizon:
-                        teacher_logits = teacher_logits[:, :self.horizon]
-                    elif teacher_logits.shape[1] < self.horizon:
-                        padding = torch.zeros(
-                            batch_size,
-                            self.horizon - teacher_logits.shape[1],
-                            device=self.device
-                        )
-                        teacher_logits = torch.cat([teacher_logits, padding], dim=1)
-                        
-                except Exception as e:
-                    print(f"警告: 教师模型前向传播失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # 如果教师模型前向传播失败，跳过这个 batch
-                    continue
-            
-            # 学生模型前向传播
-            self.optimizer.zero_grad()
             
             try:
                 # 调用学生模型的 forward 方法
@@ -586,46 +432,13 @@ class Chronos2DistillationTrainer:
             # 蒸馏损失：学生模型应该接近教师模型的预测
             distillation_loss = F.mse_loss(student_logits, teacher_logits)
             
-            # 特征蒸馏损失（第一层和最后一层）
-            feature_distill_loss = torch.tensor(0.0, device=self.device)
-            feature_loss_first = torch.tensor(0.0, device=self.device)
-            feature_loss_last = torch.tensor(0.0, device=self.device)
-            
-            if 'first' in self.teacher_features and 'first' in self.student_features:
-                teacher_feat_first = self.teacher_features['first']
-                student_feat_first = self.student_features['first']
-                
-                # 使用regressor将教师特征转换为学生维度
-                teacher_feat_first_aligned = self.feature_regressor_first(teacher_feat_first)
-                
-                # 计算第一层特征损失（MSE）
-                feature_loss_first = F.mse_loss(student_feat_first, teacher_feat_first_aligned)
-                feature_distill_loss += feature_loss_first
-            
-            if 'last' in self.teacher_features and 'last' in self.student_features:
-                teacher_feat_last = self.teacher_features['last']
-                student_feat_last = self.student_features['last']
-                
-                # 使用regressor将教师特征转换为学生维度
-                teacher_feat_last_aligned = self.feature_regressor_last(teacher_feat_last)
-                
-                # 计算最后一层特征损失（MSE）
-                feature_loss_last = F.mse_loss(student_feat_last, teacher_feat_last_aligned)
-                feature_distill_loss += feature_loss_last
-            
             # 检查损失是否为 NaN 或 Inf
-            if torch.isnan(mse_loss) or torch.isinf(mse_loss) or \
-               torch.isnan(distillation_loss) or torch.isinf(distillation_loss) or \
-               torch.isnan(feature_distill_loss) or torch.isinf(feature_distill_loss):
+            if torch.isnan(mse_loss) or torch.isinf(mse_loss) or torch.isnan(distillation_loss) or torch.isinf(distillation_loss):
                 print(f"警告: Batch {batch_idx + 1} 损失包含 NaN/Inf，跳过")
                 continue
             
-            # 组合损失：预测蒸馏损失 + 特征蒸馏损失 + 真实标签损失
-            # alpha: 预测蒸馏损失权重, beta: 特征蒸馏损失权重
-            beta = 0.3  # 特征蒸馏损失权重
-            loss = (self.alpha * distillation_loss + 
-                   (1 - self.alpha) * mse_loss + 
-                   beta * feature_distill_loss)
+            # 组合损失
+            loss = self.alpha * distillation_loss + (1 - self.alpha) * mse_loss
             
             # 限制损失值，防止数值爆炸
             if loss.item() > 1e6:
@@ -661,12 +474,8 @@ class Chronos2DistillationTrainer:
             num_batches += 1
             
             if (batch_idx + 1) % 10 == 0:
-                feat_loss_str = f", FeatDistill: {feature_distill_loss.item():.4f}" if feature_distill_loss.item() > 0 else ""
-                feat_first_str = f", FeatFirst: {feature_loss_first.item():.4f}" if feature_loss_first.item() > 0 else ""
-                feat_last_str = f", FeatLast: {feature_loss_last.item():.4f}" if feature_loss_last.item() > 0 else ""
                 print(f"Epoch {epoch}, Batch {batch_idx + 1}/{len(self.train_loader)}, "
-                      f"Loss: {loss.item():.4f}, MSE: {mse_loss.item():.4f}, Distill: {distillation_loss.item():.4f}"
-                      f"{feat_loss_str}{feat_first_str}{feat_last_str}")
+                      f"Loss: {loss.item():.4f}, MSE: {mse_loss.item():.4f}, Distill: {distillation_loss.item():.4f}")
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         return avg_loss
@@ -807,19 +616,21 @@ def main():
     output_dir = "./chronos-2-distilled"
     
     # 数据配置（参考 LightGTS 的处理方式）
-    data_dir = "data/datasets/Pretrain_Data"  # 数据目录（训练集和验证集都从此目录划分）
+    train_data_dir = "datasets/monash_csv_downsmp"  # 训练数据目录
     
     # 方式1：指定数据集名称列表（推荐，更可控）
     # 可以从目录中选择特定的数据集，例如：
-    # dataset_names = ['ETTh2', 'kdd_cup_2018_dataset_without_missing_values(0)']
-    dataset_names = None  # None 表示加载目录下所有 CSV 文件
+    # train_dataset_names = ['ETTh2', 'kdd_cup_2018_dataset_without_missing_values(0)']
+    train_dataset_names = None  # None 表示加载目录下所有 CSV 文件
     
     # 方式2：直接指定文件路径
-    data_paths = []  # 也可以指定具体的文件路径列表
+    train_data_paths = []  # 也可以指定具体的文件路径列表
     
-    # 数据划分比例（8:2 划分：训练集80%，验证集20%）
-    train_split = 0.8  # 训练集比例
-    test_split = 0.0   # 测试集比例（设为0表示不保留测试集，全部用于训练和验证）
+    # 验证数据
+    eval_data_paths = [
+        "datasets/monash_csv_downsmp"
+    ]
+    eval_dataset_names = None  # 验证集也可以使用数据集名称列表
     
     context_length = 720
     horizon = 96
@@ -846,15 +657,9 @@ def main():
     print("=" * 50)
     print("加载教师模型 (Chronos-2)...")
     print("=" * 50)
-    
-    # 确定设备（使用单个设备，避免多设备分布导致的问题）
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    
-    # 不使用 device_map，让模型加载到CPU，然后在训练器初始化时移动到指定设备
-    # 这样可以避免多设备分布导致的设备不匹配问题
     teacher_pipeline = Chronos2Pipeline.from_pretrained(
         teacher_model_id,
-        device_map=None  # 不使用 device_map，加载到CPU
+        device_map="auto"
     )
     print(f"教师模型加载完成: {teacher_model_id}")
     teacher_params = sum(p.numel() for p in teacher_pipeline.model.parameters())
@@ -877,37 +682,36 @@ def main():
     print("准备训练数据...")
     print("=" * 50)
     
-    # 训练数据集：从数据目录加载，使用8:2划分中的训练集部分
+    # 训练数据集：从 monash_csv_downsmp 目录加载（参考 LightGTS）
     train_dataset = Chronos2DistillationDataset(
-        data_paths=data_paths,
-        data_dir=data_dir,
-        dataset_names=dataset_names,  # 如果指定，只加载这些数据集
+        data_paths=train_data_paths,
+        data_dir=train_data_dir,
+        dataset_names=train_dataset_names,  # 如果指定，只加载这些数据集
         context_length=context_length,
         horizon=horizon,
         stride=stride,
         target_col=target_col,
         scale=True,  # 数据标准化（参考 LightGTS）
         split='train',  # 训练集
-        train_split=train_split,
-        test_split=test_split
+        train_split=0.8,
+        test_split=0.1
     )
     
-    # 验证数据集：从同一数据目录加载，使用8:2划分中的验证集部分
+    # 验证数据集：使用 ETTh1 数据
     print("\n" + "=" * 50)
     print("准备验证数据...")
     print("=" * 50)
     eval_dataset = Chronos2DistillationDataset(
-        data_paths=data_paths,
-        data_dir=data_dir,
-        dataset_names=dataset_names,
+        data_paths=eval_data_paths,
+        dataset_names=eval_dataset_names,
         context_length=context_length,
         horizon=horizon,
         stride=horizon,  # 验证时使用更大的步长，避免重叠
         target_col=target_col,
-        scale=True,  # 数据标准化（使用与训练集相同的scaler）
+        scale=True,  # 数据标准化
         split='val',  # 验证集
-        train_split=train_split,
-        test_split=test_split
+        train_split=0.8,
+        test_split=0.1
     )
     
     print(f"\n训练样本数: {len(train_dataset)}")
@@ -926,7 +730,6 @@ def main():
         num_epochs=num_epochs,
         temperature=temperature,
         alpha=alpha,
-        device=device,  # 传递设备参数
         output_dir=output_dir,
         max_grad_norm=max_grad_norm
     )
