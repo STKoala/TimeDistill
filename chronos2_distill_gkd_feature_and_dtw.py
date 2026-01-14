@@ -12,6 +12,9 @@ Chronos-2 蒸馏脚本 - 使用 TRL GKD 的适配方案
 
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 限制只使用第一个GPU，避免多GPU分布导致设备不匹配问题
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn as nn
@@ -29,6 +32,177 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 
 warnings.filterwarnings('ignore')
+
+
+class DTWLoss(nn.Module):
+    """
+    可微分的DTW（Dynamic Time Warping）损失函数
+    
+    DTW用于计算两个时间序列之间的对齐距离，对时间偏移更加鲁棒。
+    本实现使用soft-DTW的思想，通过可微分的动态规划实现。
+    """
+    
+    def __init__(self, gamma: float = 1.0, use_fast_approx: bool = True):
+        """
+        Parameters
+        ----------
+        gamma : float
+            Soft-DTW的温度参数，gamma越小越接近硬DTW，gamma越大越平滑
+        use_fast_approx : bool
+            如果True，使用快速近似实现（避免复杂的动态规划）
+            如果False，使用标准的soft-DTW实现（较慢但更精确）
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.use_fast_approx = use_fast_approx
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        计算DTW损失
+        
+        Parameters
+        ----------
+        pred : torch.Tensor
+            预测序列，形状为 (batch_size, seq_len) 或 (batch_size, seq_len, 1)
+        target : torch.Tensor
+            目标序列，形状为 (batch_size, seq_len) 或 (batch_size, seq_len, 1)
+            
+        Returns
+        -------
+        torch.Tensor
+            DTW损失值（标量）
+        """
+        # 确保输入是2D的 (batch_size, seq_len)
+        if pred.dim() == 3:
+            pred = pred.squeeze(-1)
+        if target.dim() == 3:
+            target = target.squeeze(-1)
+        
+        # 确保pred和target长度相同（如果不同，截断到最小长度）
+        min_len = min(pred.shape[1], target.shape[1])
+        pred = pred[:, :min_len]
+        target = target[:, :min_len]
+        
+        batch_size = pred.shape[0]
+        seq_len = pred.shape[1]
+        
+        # 批量计算距离矩阵
+        # pred: (batch_size, seq_len) -> (batch_size, seq_len, 1)
+        # target: (batch_size, seq_len) -> (batch_size, 1, seq_len)
+        pred_expanded = pred.unsqueeze(2)  # (batch_size, seq_len, 1)
+        target_expanded = target.unsqueeze(1)  # (batch_size, 1, seq_len)
+        distance_matrix = (pred_expanded - target_expanded) ** 2  # (batch_size, seq_len, seq_len)
+        
+        # 批量计算DTW损失
+        if self.use_fast_approx:
+            # 使用快速近似：计算加权平均距离
+            # 这避免了复杂的动态规划，同时保持可微分性
+            # 对于时间序列，使用soft-alignment权重
+            weights = torch.softmax(-distance_matrix / self.gamma, dim=2)  # (batch_size, n, m)
+            # 计算加权距离
+            weighted_dist = torch.sum(distance_matrix * weights, dim=(1, 2))  # (batch_size,)
+            # 归一化
+            losses = weighted_dist / (seq_len * seq_len)
+        else:
+            # 使用标准soft-DTW实现
+            losses = []
+            for i in range(batch_size):
+                dtw_loss = self._soft_dtw(distance_matrix[i], self.gamma)
+                losses.append(dtw_loss)
+            losses = torch.stack(losses)
+        
+        # 返回平均损失
+        return losses.mean()
+    
+    def _soft_dtw(self, distance_matrix: torch.Tensor, gamma: float) -> torch.Tensor:
+        """
+        计算soft-DTW距离（优化实现，使用预分配矩阵避免频繁操作）
+        
+        注意：为了性能，这里使用一个简化的实现。R矩阵使用detach来避免梯度问题，
+        但最终结果通过distance_matrix保持梯度连接。
+        
+        Parameters
+        ----------
+        distance_matrix : torch.Tensor
+            距离矩阵，形状为 (n, m)
+        gamma : float
+            温度参数（必须>0）
+            
+        Returns
+        -------
+        torch.Tensor
+            soft-DTW距离
+        """
+        n, m = distance_matrix.shape
+        
+        # 如果gamma太小，使用一个最小值避免数值不稳定
+        if gamma <= 0:
+            gamma = 1e-6
+        
+        # 使用预分配的矩阵，避免频繁的torch.cat操作
+        large_value = 1e6
+        
+        # 初始化R矩阵（使用numpy风格的数组，避免梯度问题）
+        # 使用torch.zeros初始化，然后填充大值
+        R = torch.full(
+            (n + 1, m + 1),
+            large_value,
+            device=distance_matrix.device,
+            dtype=distance_matrix.dtype
+        )
+        R[0, 0] = 0.0
+        
+        # 逐行计算（R不需要梯度，但计算过程中使用distance_matrix保持梯度）
+        # 使用with torch.no_grad()来避免R的梯度计算
+        with torch.no_grad():
+            for i in range(1, n + 1):
+                for j in range(1, m + 1):
+                    # 获取三个方向的值
+                    diag = R[i - 1, j - 1]
+                    up = R[i - 1, j]
+                    left = R[i, j - 1]
+                    
+                    # 计算三个方向的soft-min（在no_grad上下文中）
+                    r_prev = torch.stack([diag, up, left])
+                    r_prev_neg = -r_prev / gamma
+                    r_max = torch.max(r_prev_neg)
+                    exp_values = torch.exp(r_prev_neg - r_max)
+                    log_sum = torch.log(torch.sum(exp_values) + 1e-10)
+                    r_min = -gamma * (r_max + log_sum)
+                    
+                    # 计算新的累积距离（在no_grad中，使用detach的distance_matrix）
+                    # 注意：这里我们使用distance_matrix的值，但不保持梯度
+                    dist_val = distance_matrix[i - 1, j - 1].detach()
+                    new_val = dist_val + r_min
+                    R[i, j] = new_val
+        
+        # 重新计算最后一步，保持梯度连接
+        # 这是关键：我们需要重新计算最后一步，确保梯度能够通过distance_matrix传播
+        if n > 0 and m > 0:
+            # 获取最后一步的三个方向的值（从R中获取，R已计算完成）
+            diag = R[n - 1, m - 1]
+            up = R[n - 1, m]
+            left = R[n, m - 1]
+            
+            # 重新计算soft-min（这次保持梯度）
+            r_prev = torch.stack([diag, up, left])
+            r_prev_neg = -r_prev / gamma
+            r_max = torch.max(r_prev_neg)
+            exp_values = torch.exp(r_prev_neg - r_max)
+            log_sum = torch.log(torch.sum(exp_values) + 1e-10)
+            r_min = -gamma * (r_max + log_sum)
+            
+            # 最终结果（保持梯度连接，通过distance_matrix）
+            result = distance_matrix[n - 1, m - 1] + r_min
+        else:
+            # 如果n或m为0，直接返回0
+            result = torch.tensor(0.0, device=distance_matrix.device, dtype=distance_matrix.dtype)
+        
+        # 如果结果异常，使用简单的MSE作为fallback（保持梯度连接）
+        if not torch.isfinite(result):
+            result = torch.mean(distance_matrix)
+        
+        return result
 
 
 class FeatureRegressor(nn.Module):
@@ -247,6 +421,43 @@ class Chronos2DistillationDataset(Dataset):
         return self.samples[idx]
 
 
+def move_model_to_device(model: nn.Module, device: str) -> nn.Module:
+    """
+    将模型移动到指定设备
+    
+    注意：如果模型使用了accelerate hooks，不能直接移动。
+    在这种情况下，应该使用accelerate的API来管理设备，或者禁用accelerate。
+    
+    Parameters
+    ----------
+    model : nn.Module
+        要移动的模型
+    device : str
+        目标设备（如 "cuda:0" 或 "cpu"）
+    
+    Returns
+    -------
+    nn.Module
+        移动后的模型
+    """
+    # 检查模型是否使用了accelerate hooks
+    # 如果使用了accelerate，直接调用.to()会触发警告
+    # 但在我们的场景中，我们在加载时已经设置了device_map=None
+    # 所以应该可以安全地移动
+    
+    try:
+        model = model.to(device)
+    except RuntimeError as e:
+        if "accelerate hooks" in str(e).lower() or "dispatched" in str(e).lower():
+            raise RuntimeError(
+                f"模型使用了accelerate hooks，无法直接移动。"
+                f"请确保在加载模型时设置device_map=None以禁用accelerate的自动设备映射。"
+            ) from e
+        raise
+    
+    return model
+
+
 class Chronos2DistillationTrainer:
     """Chronos-2 知识蒸馏训练器"""
     
@@ -265,7 +476,9 @@ class Chronos2DistillationTrainer:
         alpha: float = 0.5,  # 蒸馏损失权重
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         output_dir: str = "./chronos-2-distilled",
-        max_grad_norm: float = 1.0  # 梯度裁剪阈值
+        max_grad_norm: float = 1.0,  # 梯度裁剪阈值
+        dtw_gamma: float = 1.0,  # DTW损失的温度参数
+        dtw_weight: float = 0.2  # DTW损失的权重
     ):
         self.teacher_pipeline = teacher_pipeline
         self.student_model = student_model
@@ -281,10 +494,18 @@ class Chronos2DistillationTrainer:
         self.device = device
         self.output_dir = output_dir
         self.max_grad_norm = max_grad_norm
+        self.dtw_gamma = dtw_gamma
+        self.dtw_weight = dtw_weight
         
-        # 将模型移到设备
-        self.teacher_pipeline.model = self.teacher_pipeline.model.to(device)
-        self.student_model = self.student_model.to(device)
+        # 初始化DTW损失函数（使用快速近似以提高性能）
+        self.dtw_loss_fn = DTWLoss(gamma=dtw_gamma, use_fast_approx=True).to(device)
+        print(f"初始化DTW损失函数: gamma={dtw_gamma}, weight={dtw_weight}, use_fast_approx=True")
+        
+        # 将模型移到设备（使用辅助函数确保所有参数都在同一设备上）
+        print(f"将教师模型移动到设备: {device}")
+        self.teacher_pipeline.model = move_model_to_device(self.teacher_pipeline.model, device)
+        print(f"将学生模型移动到设备: {device}")
+        self.student_model = move_model_to_device(self.student_model, device)
         
         # 设置教师模型为评估模式并冻结所有参数
         self.teacher_pipeline.model.eval()
@@ -613,23 +834,55 @@ class Chronos2DistillationTrainer:
                 feature_loss_last = F.mse_loss(student_feat_last, teacher_feat_last_aligned)
                 feature_distill_loss += feature_loss_last
             
+            # DTW损失：计算学生预测与真实标签之间的DTW距离
+            dtw_loss = torch.tensor(0.0, device=self.device)
+            if self.dtw_weight > 0:  # 只有当权重>0时才计算DTW
+                try:
+                    # 确保序列长度匹配
+                    min_len = min(student_logits.shape[1], future_target.shape[1])
+                    if min_len > 0:
+                        if batch_idx == 0 and epoch == 0:
+                            print(f"  计算DTW损失 (序列长度: {min_len}, batch_size: {batch_size})...")
+                        dtw_loss = self.dtw_loss_fn(
+                            student_logits[:, :min_len],
+                            future_target[:, :min_len]
+                        )
+                        # 确保DTW损失非负
+                        dtw_loss = torch.clamp(dtw_loss, min=0.0)
+                        if batch_idx == 0 and epoch == 0:
+                            print(f"  DTW损失计算完成: {dtw_loss.item():.4f}")
+                except Exception as e:
+                    print(f"警告: DTW损失计算失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    dtw_loss = torch.tensor(0.0, device=self.device)
+            
             # 检查损失是否为 NaN 或 Inf
             if torch.isnan(mse_loss) or torch.isinf(mse_loss) or \
                torch.isnan(distillation_loss) or torch.isinf(distillation_loss) or \
-               torch.isnan(feature_distill_loss) or torch.isinf(feature_distill_loss):
+               torch.isnan(feature_distill_loss) or torch.isinf(feature_distill_loss) or \
+               torch.isnan(dtw_loss) or torch.isinf(dtw_loss):
                 print(f"警告: Batch {batch_idx + 1} 损失包含 NaN/Inf，跳过")
                 continue
             
-            # 组合损失：预测蒸馏损失 + 特征蒸馏损失 + 真实标签损失
-            # alpha: 预测蒸馏损失权重, beta: 特征蒸馏损失权重
+            # 组合损失：预测蒸馏损失 + 特征蒸馏损失 + 真实标签损失 + DTW损失
+            # alpha: 预测蒸馏损失权重, beta: 特征蒸馏损失权重, dtw_weight: DTW损失权重
             beta = 0.3  # 特征蒸馏损失权重
             loss = (self.alpha * distillation_loss + 
                    (1 - self.alpha) * mse_loss + 
-                   beta * feature_distill_loss)
+                   beta * feature_distill_loss +
+                   self.dtw_weight * dtw_loss)
             
-            # 限制损失值，防止数值爆炸
-            if loss.item() > 1e6:
-                print(f"警告: Batch {batch_idx + 1} 损失过大 ({loss.item():.2f})，跳过")
+            # 检查损失值是否异常（负数或过大）
+            loss_value = loss.item()
+            if loss_value < 0:
+                print(f"警告: Batch {batch_idx + 1} 损失为负数 ({loss_value:.4f})，跳过")
+                print(f"  MSE: {mse_loss.item():.4f}, Distill: {distillation_loss.item():.4f}, "
+                      f"FeatDistill: {feature_distill_loss.item():.4f}, DTW: {dtw_loss.item():.4f}")
+                self.optimizer.zero_grad()
+                continue
+            if loss_value > 1e6:
+                print(f"警告: Batch {batch_idx + 1} 损失过大 ({loss_value:.2f})，跳过")
                 continue
             
             # 反向传播
@@ -664,20 +917,22 @@ class Chronos2DistillationTrainer:
                 feat_loss_str = f", FeatDistill: {feature_distill_loss.item():.4f}" if feature_distill_loss.item() > 0 else ""
                 feat_first_str = f", FeatFirst: {feature_loss_first.item():.4f}" if feature_loss_first.item() > 0 else ""
                 feat_last_str = f", FeatLast: {feature_loss_last.item():.4f}" if feature_loss_last.item() > 0 else ""
+                dtw_str = f", DTW: {dtw_loss.item():.4f}"
                 print(f"Epoch {epoch}, Batch {batch_idx + 1}/{len(self.train_loader)}, "
                       f"Loss: {loss.item():.4f}, MSE: {mse_loss.item():.4f}, Distill: {distillation_loss.item():.4f}"
-                      f"{feat_loss_str}{feat_first_str}{feat_last_str}")
+                      f"{feat_loss_str}{feat_first_str}{feat_last_str}{dtw_str}")
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         return avg_loss
     
     def evaluate(self):
-        """评估模型"""
+        """评估模型，返回MSE损失和DTW距离"""
         if self.eval_loader is None:
             return None
         
         self.student_model.eval()
-        total_loss = 0.0
+        total_mse_loss = 0.0
+        total_dtw_loss = 0.0
         num_batches = 0
         
         with torch.no_grad():
@@ -716,10 +971,21 @@ class Chronos2DistillationTrainer:
                         )
                         student_logits = torch.cat([student_logits, padding], dim=1)
                     
-                    # 计算 MSE 损失
+                    # 计算 MSE 损失和 DTW 距离
                     min_len = min(student_logits.shape[1], future_target.shape[1])
-                    loss = F.mse_loss(student_logits[:, :min_len], future_target[:, :min_len])
-                    total_loss += loss.item()
+                    mse_loss = F.mse_loss(student_logits[:, :min_len], future_target[:, :min_len])
+                    
+                    # 计算DTW距离
+                    try:
+                        dtw_loss = self.dtw_loss_fn(
+                            student_logits[:, :min_len],
+                            future_target[:, :min_len]
+                        )
+                    except Exception as e:
+                        dtw_loss = torch.tensor(0.0, device=self.device)
+                    
+                    total_mse_loss += mse_loss.item()
+                    total_dtw_loss += dtw_loss.item()
                     num_batches += 1
                 except Exception as e:
                     print(f"评估时出错: {e}")
@@ -727,18 +993,60 @@ class Chronos2DistillationTrainer:
                     traceback.print_exc()
                     continue
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        return avg_loss
+        avg_mse_loss = total_mse_loss / num_batches if num_batches > 0 else 0.0
+        avg_dtw_loss = total_dtw_loss / num_batches if num_batches > 0 else 0.0
+        
+        return {
+            'mse_loss': avg_mse_loss,
+            'dtw_loss': avg_dtw_loss
+        }
     
-    def train(self):
-        """执行训练"""
+    def train(self, resume_from_epoch: Optional[int] = None, resume_checkpoint_path: Optional[str] = None):
+        """
+        执行训练
+        
+        Parameters
+        ----------
+        resume_from_epoch : Optional[int]
+            从哪个epoch继续训练（如果指定了resume_checkpoint_path，此参数将被忽略）
+        resume_checkpoint_path : Optional[str]
+            从指定checkpoint路径恢复训练
+        """
         print("=" * 50)
         print("开始 Chronos-2 蒸馏训练")
         print("=" * 50)
         
+        start_epoch = 0
         best_eval_loss = float('inf')
         
-        for epoch in range(self.num_epochs):
+        # 如果指定了checkpoint路径，从checkpoint恢复
+        if resume_checkpoint_path:
+            if not os.path.exists(resume_checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint路径不存在: {resume_checkpoint_path}")
+            start_epoch, best_eval_loss = self.load_checkpoint(resume_checkpoint_path)
+            print(f"从epoch {start_epoch + 1}继续训练，最佳验证损失: {best_eval_loss:.4f}")
+        # 如果只指定了epoch编号，尝试从默认路径加载
+        elif resume_from_epoch is not None:
+            default_checkpoint_path = os.path.join(self.output_dir, f"checkpoint_epoch_{resume_from_epoch}")
+            if os.path.exists(default_checkpoint_path):
+                start_epoch, best_eval_loss = self.load_checkpoint(default_checkpoint_path)
+                print(f"从epoch {start_epoch + 1}继续训练，最佳验证损失: {best_eval_loss:.4f}")
+            else:
+                # 如果没有找到checkpoint，尝试从best_model加载
+                best_model_path = os.path.join(self.output_dir, f"best_model_epoch_{resume_from_epoch}")
+                if os.path.exists(best_model_path):
+                    print(f"警告: 未找到checkpoint，尝试从best_model加载模型（不会恢复optimizer状态）")
+                    self.student_model = Chronos2Model.from_pretrained(best_model_path)
+                    self.student_model = move_model_to_device(self.student_model, self.device)
+                    start_epoch = resume_from_epoch - 1
+                    print(f"从epoch {start_epoch + 1}继续训练（仅恢复模型权重）")
+                else:
+                    raise FileNotFoundError(
+                        f"未找到epoch {resume_from_epoch}的checkpoint或模型。"
+                        f"请检查 {default_checkpoint_path} 或 {best_model_path} 是否存在。"
+                    )
+        
+        for epoch in range(start_epoch, self.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             print("-" * 50)
             
@@ -748,15 +1056,20 @@ class Chronos2DistillationTrainer:
             
             # 评估
             if self.eval_loader:
-                eval_loss = self.evaluate()
-                if eval_loss is not None:
-                    print(f"验证损失: {eval_loss:.4f}")
+                eval_metrics = self.evaluate()
+                if eval_metrics is not None:
+                    eval_mse_loss = eval_metrics['mse_loss']
+                    eval_dtw_loss = eval_metrics['dtw_loss']
+                    print(f"验证MSE损失: {eval_mse_loss:.4f}, DTW损失: {eval_dtw_loss:.4f}")
                     
-                    # 保存最佳模型
-                    if eval_loss < best_eval_loss:
-                        best_eval_loss = eval_loss
+                    # 使用MSE损失作为主要指标来选择最佳模型
+                    if eval_mse_loss < best_eval_loss:
+                        best_eval_loss = eval_mse_loss
                         self.save_model(f"best_model_epoch_{epoch + 1}")
-                        print(f"保存最佳模型 (验证损失: {eval_loss:.4f})")
+                        print(f"保存最佳模型 (验证MSE损失: {eval_mse_loss:.4f}, DTW损失: {eval_dtw_loss:.4f})")
+            
+            # 每个epoch结束后保存checkpoint
+            self.save_checkpoint(epoch, best_eval_loss, checkpoint_name="checkpoint")
         
         # 保存最终模型
         self.save_model("final_model")
@@ -768,6 +1081,115 @@ class Chronos2DistillationTrainer:
         os.makedirs(save_path, exist_ok=True)
         self.student_model.save_pretrained(save_path)
         print(f"模型已保存到: {save_path}")
+    
+    def save_checkpoint(self, epoch: int, best_eval_loss: float, checkpoint_name: str = "checkpoint"):
+        """
+        保存完整的checkpoint（包括模型、optimizer状态、epoch等信息）
+        
+        Parameters
+        ----------
+        epoch : int
+            当前epoch编号
+        best_eval_loss : float
+            当前最佳验证损失
+        checkpoint_name : str
+            checkpoint名称
+        """
+        checkpoint_path = os.path.join(self.output_dir, f"{checkpoint_name}_epoch_{epoch + 1}")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        
+        # 保存模型
+        model_path = os.path.join(checkpoint_path, "model")
+        os.makedirs(model_path, exist_ok=True)
+        self.student_model.save_pretrained(model_path)
+        
+        # 保存特征回归器
+        regressor_path = os.path.join(checkpoint_path, "regressors.pt")
+        torch.save({
+            'feature_regressor_first': self.feature_regressor_first.state_dict(),
+            'feature_regressor_last': self.feature_regressor_last.state_dict(),
+        }, regressor_path)
+        
+        # 保存训练状态
+        checkpoint_file = os.path.join(checkpoint_path, "training_state.pt")
+        torch.save({
+            'epoch': epoch,
+            'best_eval_loss': best_eval_loss,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'learning_rate': self.learning_rate,
+            'num_epochs': self.num_epochs,
+            'alpha': self.alpha,
+            'temperature': self.temperature,
+        }, checkpoint_file)
+        
+        print(f"Checkpoint已保存到: {checkpoint_path}")
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """
+        从checkpoint加载训练状态
+        
+        Parameters
+        ----------
+        checkpoint_path : str
+            checkpoint路径（应该是包含training_state.pt和model目录的路径）
+            
+        Returns
+        -------
+        tuple
+            (epoch, best_eval_loss) 恢复的epoch编号和最佳验证损失
+        """
+        model_path = os.path.join(checkpoint_path, "model")
+        training_state_path = os.path.join(checkpoint_path, "training_state.pt")
+        regressor_path = os.path.join(checkpoint_path, "regressors.pt")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型目录不存在: {model_path}")
+        if not os.path.exists(training_state_path):
+            raise FileNotFoundError(f"训练状态文件不存在: {training_state_path}")
+        
+        print(f"从checkpoint加载: {checkpoint_path}")
+        
+        # 加载模型
+        print("加载学生模型...")
+        self.student_model = Chronos2Model.from_pretrained(model_path)
+        self.student_model = move_model_to_device(self.student_model, self.device)
+        
+        # 加载特征回归器
+        if os.path.exists(regressor_path):
+            print("加载特征回归器...")
+            regressor_state = torch.load(regressor_path, map_location=self.device)
+            self.feature_regressor_first.load_state_dict(regressor_state['feature_regressor_first'])
+            self.feature_regressor_last.load_state_dict(regressor_state['feature_regressor_last'])
+        
+        # 加载训练状态
+        print("加载训练状态...")
+        checkpoint = torch.load(training_state_path, map_location=self.device)
+        
+        epoch = checkpoint.get('epoch', 0)
+        best_eval_loss = checkpoint.get('best_eval_loss', float('inf'))
+        
+        # 重新创建optimizer（因为模型参数可能已改变）
+        optimizer_params = list(self.student_model.parameters()) + \
+                          list(self.feature_regressor_first.parameters()) + \
+                          list(self.feature_regressor_last.parameters())
+        self.optimizer = torch.optim.AdamW(
+            optimizer_params,
+            lr=checkpoint.get('learning_rate', self.learning_rate),
+            weight_decay=1e-4,
+            eps=1e-8
+        )
+        
+        # 加载optimizer状态
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Optimizer状态已加载")
+            except Exception as e:
+                print(f"警告: 无法加载optimizer状态，将使用新的optimizer状态: {e}")
+        
+        print(f"成功加载checkpoint: epoch={epoch + 1}, best_eval_loss={best_eval_loss:.4f}")
+        return epoch, best_eval_loss
 
 
 def create_student_model(
@@ -807,6 +1229,7 @@ def main():
     output_dir = "./chronos-2-distilled"
     
     # 数据配置（参考 LightGTS 的处理方式）
+    # data_dir = "data/datasets/Eval_Data/traffic" # 先用小数据集测试一下能否跑通
     data_dir = "data/datasets/Pretrain_Data"  # 数据目录（训练集和验证集都从此目录划分）
     
     # 方式1：指定数据集名称列表（推荐，更可控）
@@ -823,12 +1246,12 @@ def main():
     
     context_length = 720
     horizon = 96
-    stride = 1
+    stride = 96
     target_col = None  # None 表示自动检测（通常是最后一列或第一个数值列）
     
     # 学生模型配置
     student_config_overrides = {
-        "num_layers": 3,      # 减少层数
+        "num_layers": 6,      # 减少层数
         "d_model": 384,       # 减少隐藏层维度
         "d_ff": 1536,         # 减少前馈网络维度
         "num_heads": 6,       # 减少注意力头数
@@ -837,10 +1260,14 @@ def main():
     # 训练配置
     learning_rate = 1e-5  # 降低学习率，提高稳定性
     batch_size = 256
-    num_epochs = 10
+    num_epochs = 20
     temperature = 2.0
     alpha = 0.5  # 蒸馏损失权重
     max_grad_norm = 1.0  # 梯度裁剪阈值
+    
+    # DTW损失配置
+    dtw_gamma = 1.0  # DTW损失的温度参数（gamma越小越接近硬DTW，gamma越大越平滑）
+    dtw_weight = 0.2  # DTW损失的权重（建议范围：0.1-0.3）
     
     # ========== 加载教师模型 ==========
     print("=" * 50)
@@ -852,10 +1279,20 @@ def main():
     
     # 不使用 device_map，让模型加载到CPU，然后在训练器初始化时移动到指定设备
     # 这样可以避免多设备分布导致的设备不匹配问题
+    
     teacher_pipeline = Chronos2Pipeline.from_pretrained(
         teacher_model_id,
         device_map=None  # 不使用 device_map，加载到CPU
     )
+    # 确保模型完全在CPU上（避免accelerate自动分配设备）
+    # 注意：如果模型使用了accelerate hooks，这里会触发警告，但应该仍然可以工作
+    try:
+        teacher_pipeline.model = teacher_pipeline.model.to("cpu")
+    except RuntimeError as e:
+        if "accelerate hooks" in str(e).lower():
+            print("警告：模型使用了accelerate hooks，跳过CPU移动。将在初始化时处理设备问题。")
+        else:
+            raise
     print(f"教师模型加载完成: {teacher_model_id}")
     teacher_params = sum(p.numel() for p in teacher_pipeline.model.parameters())
     print(f"教师模型参数量: {teacher_params:,}")
@@ -928,10 +1365,20 @@ def main():
         alpha=alpha,
         device=device,  # 传递设备参数
         output_dir=output_dir,
-        max_grad_norm=max_grad_norm
+        max_grad_norm=max_grad_norm,
+        dtw_gamma=dtw_gamma,  # DTW损失温度参数
+        dtw_weight=dtw_weight  # DTW损失权重
     )
     
-    trainer.train()
+    # ========== 继续训练选项 ==========
+    # 如果需要从某个epoch继续训练，设置resume_from_epoch参数
+    # 例如：resume_from_epoch = 9  # 从第9个epoch继续（会从checkpoint_epoch_9或best_model_epoch_9加载）
+    # 或者直接指定checkpoint路径：
+    # resume_checkpoint_path = "./chronos-2-distilled/checkpoint_epoch_9"
+    resume_from_epoch = None  # 设置为None表示从头开始训练，或者设置为epoch编号（从1开始，例如9表示从第9个epoch继续）
+    resume_checkpoint_path = None  # 直接指定checkpoint路径（优先级高于resume_from_epoch）
+    
+    trainer.train(resume_from_epoch=resume_from_epoch, resume_checkpoint_path=resume_checkpoint_path)
     
     print("\n" + "=" * 50)
     print("蒸馏完成！")

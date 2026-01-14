@@ -621,7 +621,7 @@ def main():
     teacher_model_id = "amazon/chronos-2"  # 或 "amazon/chronos-2-base"
     # data_path = "datasets/eval/ETT-small/ETTm1.csv"
     # data_path = "datasets/eval/traffic/traffic.csv" 
-    data_path = "datasets/eval/electricity/electricity.csv" 
+    data_path = "data/datasets/Eval_Data/traffic/traffic.csv"
 
     # 测试参数
     start_idx = 0  # 从第 500 个时间点开始测试（可以修改）

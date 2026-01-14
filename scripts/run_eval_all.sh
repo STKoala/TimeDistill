@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_EVAL_SCRIPT="$SCRIPT_DIR/run_eval.sh"
 
 # 设置默认参数（可以通过环境变量覆盖）
-EVAL_DIR="${EVAL_DIR:-datasets/Eval_Data}"
+EVAL_DIR="${EVAL_DIR:-data/datasets/Eval_Data}"
 MODEL_PATH="${MODEL_PATH:-./chronos-2-distilled/final_model}"
 TEACHER_MODEL_ID="${TEACHER_MODEL_ID:-amazon/chronos-2}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-720}"
