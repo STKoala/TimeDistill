@@ -9,11 +9,10 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import torch.nn.functional as F
 from chronos import Chronos2Pipeline, Chronos2Model
-from chronos2_distill_gkd import (
-    Chronos2DistillationDataset,
-    Chronos2DistillationTrainer,
-    create_student_model
-)
+from TimeDistill.datasets import Chronos2DistillationDataset
+from TimeDistill.models import create_student_model
+from TimeDistill.trainers import Chronos2DistillationTrainer
+from torch.utils.data import DataLoader
 
 def main():
     """简化的蒸馏示例"""
@@ -48,18 +47,17 @@ def main():
     
     # 4. 创建训练器并训练
     print("开始训练...")
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0)
     trainer = Chronos2DistillationTrainer(
         teacher_pipeline=teacher_pipeline,
         student_model=student_model,
-        train_dataset=train_dataset,
-        context_length=96,
+        train_loader=train_loader,
+        eval_loader=None,
         horizon=24,
         learning_rate=5e-5,
-        batch_size=16,
         num_epochs=5,
         temperature=2.0,
-        alpha=0.5,
-        output_dir="./chronos-2-distilled-simple"
+        output_dir="./chronos-2-distilled-simple",
     )
     
     trainer.train()
