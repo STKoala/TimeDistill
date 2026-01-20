@@ -1,0 +1,23 @@
+TimesFM 测试结果汇总
+====================================================================================================
+
+测试时间: 2026-01-16 09:59:06.120337
+模型路径: /root/shengyuan/Distillation/TimeDistill/timesfm-trained/final_model
+Context Length: 720
+Horizon: 96
+测试数据集数量: 10
+
+序号     数据集名称                                              MSE          MAE          RMSE         相关系数      
+----------------------------------------------------------------------------------------------------
+1      london_smart_meters_dataset_without_missing_values(4086)_downsample_2.csv 0.374587     0.391990     0.612035     0.7480    
+2      london_smart_meters_dataset_without_missing_values(2974)_downsample_2.csv 0.694642     0.707489     0.833452     0.3194    
+3      london_smart_meters_dataset_without_missing_values(983)_downsample_2.csv 0.220047     0.299794     0.469092     0.0024    
+4      london_smart_meters_dataset_without_missing_values(3659)_downsample_2.csv 1.108420     0.587349     1.052815     0.2495    
+5      weather_dataset(1386).csv                          0.039292     0.169001     0.198222     0.0000    
+6      london_smart_meters_dataset_without_missing_values(3088)_downsample_2.csv 1.362976     0.870104     1.167466     0.3164    
+7      london_smart_meters_dataset_without_missing_values(2188)_downsample_2.csv 0.503271     0.520637     0.709416     0.3909    
+8      london_smart_meters_dataset_without_missing_values(1844)_downsample_2.csv 0.957328     0.443588     0.978431     0.4142    
+9      london_smart_meters_dataset_without_missing_values(5167)_downsample_2.csv 1.739973     0.477843     1.319080     0.1567    
+10     kdd_cup_2018_dataset_without_missing_values(1).csv 0.836099     0.787978     0.914384     0.1783    
+----------------------------------------------------------------------------------------------------
+平均                                                        0.783663     0.525577     0.825439     0.2776    

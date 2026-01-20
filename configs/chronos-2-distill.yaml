@@ -1,0 +1,50 @@
+# Chronos-2 知识蒸馏配置文件
+
+# 模型配置
+model:
+  teacher_model_id: "amazon/chronos-2"
+  student_config_overrides:
+    num_layers: 6
+    d_model: 384
+    d_ff: 1536
+    num_heads: 6
+
+# 数据配置
+data:
+  data_dir: "data/datasets/Pretrain_Data"
+  dataset_names: null  # null表示加载目录下所有CSV文件，或指定列表如: ["ETTh1", "ETTh2"]
+  context_length: 720
+  horizon: 96
+  stride: 96
+  target_col: null  # null表示自动检测
+  train_split: 0.8
+  test_split: 0.0
+  scale: true
+  time_col_name: "date"
+
+# 训练配置
+training:
+  learning_rate: 1e-5
+  batch_size: 256
+  num_epochs: 20
+  max_grad_norm: 1.0
+  num_workers: 0  # GPU训练时建议设为0
+  pin_memory: false
+
+# 损失函数配置
+loss:
+  alpha_pred_distill: 0.5  # 预测蒸馏(soft) vs 真实标签(hard) 的插值
+  beta_feature: 0.3  # 特征蒸馏权重
+  dtw_weight: 0.2  # DTW 损失权重（0 表示禁用）
+  dtw_gamma: 1.0
+  use_fast_dtw: true
+  temperature: 2.0
+
+# 系统配置
+system:
+  device: "cuda:0"
+  output_dir: "./checkpoints/chronos-2-distill"
+  verbose: true
+  hf_endpoint: "https://hf-mirror.com"
+  cuda_visible_devices: "0"
+

@@ -1,0 +1,9 @@
+{
+  "context_length": 720,
+  "horizon": 96,
+  "d_model": 256,
+  "nhead": 4,
+  "num_layers": 3,
+  "dim_feedforward": 512,
+  "dropout": 0.1
+}

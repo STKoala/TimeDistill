@@ -42,3 +42,4 @@ def move_model_to_device(model: nn.Module, device: str) -> nn.Module:
     
     return model
 
+
